@@ -3,27 +3,34 @@ extern crate sdl2;
 
 use glm::Vec2;
 use rand::Rng;
-use std::boxed::Box;
 use std::path::Path;
 use sdl2::pixels::Color;
-use sdl2::event::{Event, WindowEvent};
-use sdl2::keyboard::{Keycode, Scancode};
+use sdl2::event::Event;
+use sdl2::keyboard::Scancode;
 use sdl2::video::Window;
 use sdl2::rect::Rect;
-use sdl2::render::Canvas;
+use sdl2::render::{BlendMode, Canvas};
 use sdl2::rwops::RWops;
 use std::time::{Duration, Instant};
 use sdl2::mixer::LoaderRWops;
-// use rust_embed::RustEmbed;
+use rust_embed::RustEmbed;
 
-// #[derive(RustEmbed)]
-// #[folder = "./assets/"]
-// struct Asset;
+#[macro_use]
+use strum_macros::{EnumString, EnumVariantNames};
+use strum::VariantNames;
+
+#[derive(RustEmbed)]
+#[folder = "./assets/"]
+struct Asset;
 
 const SCREEN_WIDTH: u32 = 640;
 const SCREEN_HEIGHT: u32 = 480;
 
 const ASTEROID_SPAWN_TIME: f32 = 5.0;
+
+thread_local! {
+    static SOUNDS: Vec<sdl2::mixer::Chunk> = load_all_sounds().unwrap();
+}
 
 macro_rules! rect (
     ($x:expr, $y:expr, $w:expr, $h:expr) => (
@@ -39,10 +46,10 @@ macro_rules! rect_from_center (
 pub fn main() -> Result<(), String> {
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
-    let _audio_subsystem = sdl_context.audio()?;
+    // let _audio_subsystem = sdl_context.audio()?;
     let ttf_context = sdl2::ttf::init().map_err(|e| e.to_string())?;
 
-    // let font_path = Path::new("./assets/fonts/Open 24 Display St.ttf");
+    let font_path = Path::new("./assets/fonts/Open 24 Display St.ttf");
     let font_data = include_bytes!("../assets/fonts/Open 24 Display St.ttf");
     let mut font = ttf_context.load_font_from_rwops(RWops::from_bytes(font_data)?, 64)?;
     font.set_style(sdl2::ttf::FontStyle::NORMAL);
@@ -56,7 +63,8 @@ pub fn main() -> Result<(), String> {
         sdl2::mixer::allocate_channels(4);
     }
 
-    let sounds = Sounds::load_sounds()?;
+    // This will initialize SOUNDS
+    SOUNDS.with(|_| {});
 
     let window = video_subsystem.window("Asteroids", SCREEN_WIDTH, SCREEN_HEIGHT)
         .position_centered()
@@ -64,6 +72,7 @@ pub fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     
     let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
+    canvas.set_blend_mode(BlendMode::Blend);
     let texture_creator = canvas.texture_creator();
 
     canvas.set_draw_color(Color::RGB(0, 64, 255));
@@ -112,7 +121,11 @@ pub fn main() -> Result<(), String> {
                 // },
                 Event::KeyDown { scancode: Some(Scancode::Space), repeat: false, .. } if player.is_alive => {
                     bullets.push(player.spawn_bullet());
-                    play_sound(&sounds.shoot);
+                    play_sound(Sound::Shoot);
+                },
+                Event::KeyDown { scancode: Some(Scancode::R), .. } if !player.is_alive => {
+                    player.is_alive = true;
+
                 },
                 _ => {}
             }
@@ -172,7 +185,7 @@ pub fn main() -> Result<(), String> {
             if player.is_alive {
                 if are_colliding(asteroid.get_rect(), player.get_rect()) {
                     player.is_alive = false;
-                    play_sound(&sounds.explode);
+                    play_sound(Sound::Explode);
                     particles.append(&mut player.spawn_death_particles(100));
                 }
             }
@@ -238,7 +251,7 @@ impl Player {
     const ACC_RATE: f32 = 500.0;
     const ROTATION_RATE: f32 = 6.0;
     const BULLET_SPAWN_Y_OFFSET: f32 = -10.0;
-    const RADIUS: u32 = 20;
+    const RADIUS: u32 = 14;
 
     fn new(x_pos: f32, y_pos: f32) -> Player {
         Player {
@@ -272,10 +285,14 @@ impl Player {
     }
 
     fn draw(&self, canvas: &mut Canvas<Window>) -> Result<(), String> {
+        let left_coord = -(Self::RADIUS as f32) + 2.0;
+        let right_coord = -left_coord;
+        let top_coord = -(Self::RADIUS as f32) - 4.0;
+        let bottom_coord = -top_coord;
         let point_offsets = vec![
-            glm::rotate_vec2(&glm::vec2(0.0, -16.0), self.rot),
-            glm::rotate_vec2(&glm::vec2(-8.0, 8.0), self.rot),
-            glm::rotate_vec2(&glm::vec2(8.0, 8.0), self.rot),
+            glm::rotate_vec2(&glm::vec2(0.0, top_coord), self.rot),
+            glm::rotate_vec2(&glm::vec2(left_coord, bottom_coord), self.rot),
+            glm::rotate_vec2(&glm::vec2(right_coord, bottom_coord), self.rot),
         ];
         canvas.set_draw_color(Color::RGB(0, 255, 50));
         for i in 0..point_offsets.len() {
@@ -287,6 +304,8 @@ impl Player {
             canvas.draw_line((p1.x as i32, p1.y as i32),
                             (p2.x as i32, p2.y as i32))?
         }
+
+        draw_debug_rect(self.get_rect(), canvas)?;
 
         Ok(())
     }
@@ -520,39 +539,54 @@ fn try_wrap_around_screen(pos: Vec2, radius: u32) -> Vec2 {
     glm::vec2(result_x, result_y)
 }
 
-struct Sounds {
-    shoot: sdl2::mixer::Chunk,
-    explode: sdl2::mixer::Chunk,
+struct GameState {
+    player: Player,
+    bullets: Vec<Bullet>,
+    asteroids: Vec<Asteroid>,
+    particles: Vec<Particle>,
 }
 
-impl Sounds {
-    fn load_sounds() -> Result<Sounds, String> {
-        let shoot = RWops::from_bytes(include_bytes!("../assets/sounds/shoot.wav"))?.load_wav()?;
-        let explode = RWops::from_bytes(include_bytes!("../assets/sounds/explode.wav"))?.load_wav()?;
-
-        Ok(
-            Sounds {
-                shoot,
-                explode,
-            }
-        )
-    }
+#[derive(Debug, EnumString, EnumVariantNames)]
+#[strum(serialize_all = "snake_case")]
+enum Sound {
+    Shoot,
+    Explode,
+    Hit,
 }
 
-fn play_sound(sound: &sdl2::mixer::Chunk) {
-    match sdl2::mixer::Channel::all().play(sound, 0) {
-        Err(e) if e == "No free channels available" => {
-            // TODO in case getting these two values is some kind of a
-            // race condition, lets store total allocated channels
-            // somewhere else (global game state?)
-            let playing_channels = sdl2::mixer::get_playing_channels_number();
-            let paused_channels = sdl2::mixer::get_paused_channels_number();
-            println!("Not enough channels. Adding another.");
-            sdl2::mixer::allocate_channels(playing_channels + paused_channels + 1);
-        },
-        Err(e) => println!("{}", e),
-        Ok(_channel) => {},
+fn load_all_sounds() -> Result<Vec<sdl2::mixer::Chunk>, String> {
+    let mut sounds = Vec::new();
+    for variant in Sound::VARIANTS {
+        let path = &format!("sounds/{}.wav", variant);
+        let file = &Asset::get(path).ok_or(format!("Failed to get file: {}.wav", variant))?;
+        sounds.push(load_sound(file)?);
     }
+
+    Ok(sounds)
+}
+
+fn load_sound(file: &[u8]) -> Result<sdl2::mixer::Chunk, String> {
+    RWops::from_bytes(file)?.load_wav()
+}
+
+
+fn play_sound(sound: Sound) {
+    SOUNDS.with(|sounds| {
+        let chunk = &sounds[sound as usize];
+        match sdl2::mixer::Channel::all().play(chunk, 0) {
+            Err(e) if e == "No free channels available" => {
+                // TODO in case getting these two values is some kind of a
+                // race condition, lets store total allocated channels
+                // somewhere else (global game state?)
+                let playing_channels = sdl2::mixer::get_playing_channels_number();
+                let paused_channels = sdl2::mixer::get_paused_channels_number();
+                println!("Not enough channels. Adding another.");
+                sdl2::mixer::allocate_channels(playing_channels + paused_channels + 1);
+            },
+            Err(e) => println!("{}", e),
+            Ok(_channel) => {},
+        }
+    })
 }
 
 fn are_colliding(rect1: Rect, rect2: Rect) -> bool {
@@ -577,3 +611,12 @@ fn spawn_hit_particles(pos: Vec2, num: u32) -> Vec<Particle> {
 
     particles
 }
+
+fn draw_debug_rect(rect: Rect, canvas: &mut Canvas<Window>) -> Result<(), String> {
+    let color = Color::RGBA(100, 100, 200, 140);
+    canvas.set_draw_color(color);
+    canvas.fill_rect(rect)?;
+
+    Ok(())
+}
+
