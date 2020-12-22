@@ -11,6 +11,9 @@ edition = "2018"
 nalgebra-glm = "0.9.0"
 rand = "0.7.3"
 rust-embed = "5.7.0"
+lazy_static = "1.4.0"
+strum = "0.20"
+strum_macros = "0.20"
 
 [dependencies.sdl2]
 version = "0.34.3"
